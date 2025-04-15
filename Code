@@ -1,0 +1,254 @@
+import pandas as pd
+import numpy as np
+import joblib
+import os
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score, classification_report, roc_auc_score, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+from imblearn.over_sampling import SMOTE
+import warnings
+warnings.filterwarnings('ignore')
+
+class ALSPredictor:
+    def __init__(self):
+        self.MODEL_FILE = "als_model.pkl"
+        self.SCALER_FILE = "scaler.pkl"
+        self.FEATURE_FILE = "feature_names.pkl"
+        self.clf = None
+        self.scaler = None
+        self.accuracy_history = []
+        self.feature_importance = None
+        self.feature_names = None
+
+    def plot_accuracy_metrics(self, y_test, y_pred, y_pred_proba):
+        plt.figure(figsize=(15, 5))
+        
+        # Confusion Matrix
+        plt.subplot(121)
+        cm = confusion_matrix(y_test, y_pred)
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+        plt.title('Confusion Matrix')
+        plt.ylabel('True Label')
+        plt.xlabel('Predicted Label')
+        
+        # Feature Importance
+        plt.subplot(122)
+        importances = pd.DataFrame({
+            'feature': self.feature_names,
+            'importance': self.feature_importance
+        }).sort_values('importance', ascending=False)
+        sns.barplot(x='importance', y='feature', data=importances.head(10))
+        plt.title('Top 10 Feature Importance')
+        
+        plt.tight_layout()
+        plt.savefig('model_metrics.png')
+        plt.close()
+        
+    def preprocess_data(self, df):
+        processed_df = df.copy()
+        
+        processed_df['BMI_Category'] = pd.cut(processed_df['BMI'], 
+                                            bins=[0, 18.5, 24.9, 29.9, 100],
+                                            labels=[0, 1, 2, 3])
+        
+        processed_df['Age_ALSFRS'] = processed_df['Age'] * processed_df['ALSFRS_R_Score']
+        processed_df['FVC_BMI'] = processed_df['FVC (%)'] * processed_df['BMI']
+        
+        processed_df['Severity_Index'] = (
+            (processed_df['Speech_Difficulty'] * 2) +
+            (processed_df['Respiratory_Issues'] * 2) +
+            (processed_df['Cognitive_Decline'] * 1.5) +
+            ((5 - processed_df['Muscle_Weakness_Score']) * 1.5)
+        )
+        
+        return processed_df
+    
+    def train_model(self, data_file):
+        # Load and preprocess data
+        df = pd.read_csv(data_file)
+        
+        categorical_mapping = {
+            'Gender': {'Male': 0, 'Female': 1},
+            'Speech_Difficulty': {'No': 0, 'Yes': 1},
+            'Respiratory_Issues': {'No': 0, 'Yes': 1},
+            'Cognitive_Decline': {'No': 0, 'Yes': 1},
+            'Outcome': {'Non-ALS': 0, 'ALS': 1}
+        }
+        
+        for column, mapping in categorical_mapping.items():
+            df[column] = df[column].map(mapping)
+        
+        df = self.preprocess_data(df)
+        
+        X = df.drop(['Patient_ID', 'Blood_Pressure', 'Outcome'], axis=1)
+        y = df['Outcome']
+        
+        self.feature_names = X.columns.tolist()
+        
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y
+        )
+        
+        self.scaler = StandardScaler()
+        X_train_scaled = self.scaler.fit_transform(X_train)
+        X_test_scaled = self.scaler.transform(X_test)
+        
+        smote = SMOTE(random_state=42)
+        X_train_resampled, y_train_resampled = smote.fit_resample(X_train_scaled, y_train)
+        
+        param_grid = {
+            'n_estimators': [100, 200, 300],
+            'max_depth': [10, 20, 30, None],
+            'min_samples_split': [2, 5, 10],
+            'min_samples_leaf': [1, 2, 4],
+            'class_weight': ['balanced', 'balanced_subsample']
+        }
+        
+        base_clf = RandomForestClassifier(random_state=42)
+        self.clf = GridSearchCV(
+            base_clf,
+            param_grid,
+            cv=5,
+            scoring='roc_auc',
+            n_jobs=-1
+        )
+        
+        print("Training model...")
+        self.clf.fit(X_train_resampled, y_train_resampled)
+        
+        self.feature_importance = self.clf.best_estimator_.feature_importances_
+        
+        # Make predictions
+        y_pred = self.clf.predict(X_test_scaled)
+        y_pred_proba = self.clf.predict_proba(X_test_scaled)[:, 1]
+        
+        # Calculate metrics
+        accuracy = accuracy_score(y_test, y_pred)
+        roc_auc = roc_auc_score(y_test, y_pred_proba)
+        cv_scores = cross_val_score(self.clf, X_train_resampled, y_train_resampled, cv=5)
+        
+        self.accuracy_history.append({
+            'accuracy': accuracy,
+            'roc_auc': roc_auc,
+            'cv_mean': cv_scores.mean(),
+            'cv_std': cv_scores.std()
+        })
+        
+        print("\n=== Model Performance Metrics ===")
+        print(f"Best parameters: {self.clf.best_params_}")
+        print(f"\nAccuracy: {accuracy:.4f}")
+        print(f"ROC-AUC Score: {roc_auc:.4f}")
+        print(f"Cross-validation accuracy: {cv_scores.mean():.4f} (+/- {cv_scores.std() * 2:.4f})")
+        
+        print("\nClassification Report:")
+        print(classification_report(y_test, y_pred))
+        
+        self.plot_accuracy_metrics(y_test, y_pred, y_pred_proba)
+        
+        # Save model components separately
+        joblib.dump(self.clf, self.MODEL_FILE)
+        joblib.dump(self.scaler, self.SCALER_FILE)
+        joblib.dump(self.feature_names, self.FEATURE_FILE)
+        
+        return self.clf, self.scaler
+    
+    def load_model(self):
+        try:
+            if all(os.path.exists(f) for f in [self.MODEL_FILE, self.SCALER_FILE, self.FEATURE_FILE]):
+                self.clf = joblib.load(self.MODEL_FILE)
+                self.scaler = joblib.load(self.SCALER_FILE)
+                self.feature_names = joblib.load(self.FEATURE_FILE)
+                return True
+            return False
+        except Exception as e:
+            print(f"Error loading model: {str(e)}")
+            return False
+    
+    def predict_als(self):
+        if not self.load_model():
+            print("Error: Model files not found. Please train the model first.")
+            return
+        
+        print("\nEnter patient details:")
+        try:
+            input_data = {
+                'Age': int(input("Age: ")),
+                'Gender': input("Gender (Male/Female): ").strip().capitalize(),
+                'ALSFRS_R_Score': int(input("ALSFRS-R Score (0-48): ")),
+                'Onset_Duration_Months': int(input("Onset Duration (Months): ")),
+                'FVC (%)': float(input("FVC (%): ")),
+                'Muscle_Weakness_Score': int(input("Muscle Weakness Score (1-5): ")),
+                'Speech_Difficulty': input("Speech Difficulty (Yes/No): ").strip().capitalize(),
+                'Respiratory_Issues': input("Respiratory Issues (Yes/No): ").strip().capitalize(),
+                'Cognitive_Decline': input("Cognitive Decline (Yes/No): ").strip().capitalize(),
+                'BMI': float(input("BMI: ")),
+                'Creatinine (mg/dL)': float(input("Creatinine (mg/dL): "))
+            }
+            
+            if not (0 <= input_data['ALSFRS_R_Score'] <= 48):
+                raise ValueError("ALSFRS-R Score must be between 0 and 48")
+            if not (1 <= input_data['Muscle_Weakness_Score'] <= 5):
+                raise ValueError("Muscle Weakness Score must be between 1 and 5")
+            
+        except ValueError as e:
+            print(f"Invalid input: {str(e)}")
+            return
+        
+        input_data['Gender'] = 0 if input_data['Gender'] == 'Male' else 1
+        input_data['Speech_Difficulty'] = 1 if input_data['Speech_Difficulty'] == 'Yes' else 0
+        input_data['Respiratory_Issues'] = 1 if input_data['Respiratory_Issues'] == 'Yes' else 0
+        input_data['Cognitive_Decline'] = 1 if input_data['Cognitive_Decline'] == 'Yes' else 0
+        
+        df_input = pd.DataFrame([input_data])
+        df_input = self.preprocess_data(df_input)
+        df_input = df_input[self.feature_names]
+        
+        scaled_input = self.scaler.transform(df_input)
+        
+        prediction = self.clf.predict(scaled_input)[0]
+        probability = self.clf.predict_proba(scaled_input)[0]
+        
+        result = 'ALS' if prediction == 1 else 'Non-ALS'
+        confidence = probability[1] if prediction == 1 else probability[0]
+        
+        print("\n=== Prediction Results ===")
+        print(f"Prediction: {result}")
+        print(f"Confidence: {confidence:.2%}")
+        
+        if self.accuracy_history:
+            latest_metrics = self.accuracy_history[-1]
+            print(f"\nModel Accuracy: {latest_metrics['accuracy']:.2%}")
+            print(f"Model ROC-AUC: {latest_metrics['roc_auc']:.2%}")
+        
+        risk_factors = []
+        if input_data['Age'] > 60:
+            risk_factors.append("Advanced age")
+        if input_data['ALSFRS_R_Score'] < 40:
+            risk_factors.append("Low ALSFRS-R Score")
+        if input_data['FVC (%)'] < 80:
+            risk_factors.append("Reduced lung function")
+        if input_data['Muscle_Weakness_Score'] <= 3:
+            risk_factors.append("Significant muscle weakness")
+        
+        if risk_factors:
+            print("\nIdentified risk factors:")
+            for factor in risk_factors:
+                print(f"- {factor}")
+
+def main():
+    predictor = ALSPredictor()
+    
+    if not predictor.load_model():
+        print("Training new model...")
+        predictor.train_model("C:/Users/LG/Documents/data/als_detection_realistic_dataset.csv")
+    
+    while True:
+        predictor.predict_als()
+        if input("\nWould you like to make another prediction? (yes/no): ").lower() != 'yes':
+            break
+
+if __name__ == "__main__":
+    main()
